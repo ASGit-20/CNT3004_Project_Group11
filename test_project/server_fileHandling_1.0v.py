@@ -1,19 +1,4 @@
 """
-FILE SERVER  (run this first, on the computer that will store the files)
-
-How to run:
-    1. Set IP below to this computer's IP address (or "127.0.0.1" to test on one PC).
-    2. python server.py
-    3. Start client.py on any computer that can reach this IP and PORT.
-
-How it works:
-    - The server listens for TCP connections. Every client gets its own thread,
-      so many clients can use the server at the same time.
-    - The client sends a command as text:   COMMAND@argument@argument
-    - The server answers with a line:       STATUS@message
-      STATUS is "OK" or "ERROR" (a few commands also use EXISTS / READY / CANCELLED).
-    - Files are stored inside the folder named SERVER_PATH.
-
 Commands the server understands:
     UPLOAD@name@size        client sends a file to the server
     DOWNLOAD@name           client gets a file from the server
