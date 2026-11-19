@@ -1,29 +1,3 @@
-"""
-client.py
-CNT3004 - Socket-Based Networked File Sharing Cloud Server
-
-Client-side application for:
-    connect/authenticate
-    upload
-    download
-    delete
-    dir
-    subfolder create/delete
-
-Protocol:
-    Every control message is a length-prefixed JSON object.
-    File data is transferred as length-prefixed binary chunks.
-
-Expected server responses/requests are documented in the methods below.
-The client never sends a plaintext password. Authentication uses a nonce
-challenge and HMAC-SHA256:
-
-    proof = HMAC-SHA256(key=SHA256(password), msg=server_nonce)
-
-The server must implement the same protocol for this client to connect.
-"""
-
-import argparse
 import ssl
 import hashlib
 import hmac
@@ -33,11 +7,12 @@ import socket
 import struct
 import sys
 import time
+from pwinput import pwinput
 from pathlib import Path
 from typing import Any, Optional
 
 
-DEFAULT_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+DEFAULT_CHUNK_SIZE = 1024 * 1024
 MAX_JSON_MESSAGE = 1024 * 1024
 SOCKET_TIMEOUT = 30.0
 
@@ -51,8 +26,8 @@ class FileTransferClient:
         self,
         server_ip: str,
         port: int,
-        username: str,
-        password: str,
+        username: str = None,
+        password: str = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         timeout: float = SOCKET_TIMEOUT,
     ):
@@ -69,7 +44,12 @@ class FileTransferClient:
     # ------------------------------------------------------------
 
     def connect(self) -> None:
-        """Connect to the server and complete challenge-response auth."""
+
+        print("\n" + "=" * 56)
+        print("              FILE SHARING CLIENT v1.0")
+        print("=" * 56)
+
+
         if self.sock is not None:
             self.close()
 
@@ -86,16 +66,21 @@ class FileTransferClient:
 
         sock.connect((self.server_ip, self.port))
         self.sock = sock
+        print(f"Connected to {self.server_ip}:{self.port}\n")
+
+
+        username = input('Username: ')
+        password = pwinput("Password: ", mask="*")
 
 
         self._send_json(
             {
                 "command": "LOGIN",
-                "username": 'fern',
-                "password": 'hello123'
+                "username": username,
+                "password": password
             }
         )
-        # Receive authentication challenge
+        
         response = self._recv_json()
 
         if response.get("status") != "SUCCESS":
@@ -103,11 +88,9 @@ class FileTransferClient:
                 f"Expected SUCCESS challenge, got: {response}"
             )
 
-        print(f"Connected to {self.server_ip}:{self.port}")
-        print(f"Authenticated as {self.username}")
+        print(f"[OK] Authenticated successful")
 
     def close(self) -> None:
-        """Close the TCP connection."""
         if self.sock is not None:
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
@@ -170,12 +153,10 @@ class FileTransferClient:
         return message
 
     def _send_data(self, data: bytes) -> None:
-        """Send one binary data frame."""
         sock = self._require_connection()
         sock.sendall(data)
 
     def _recv_data(self, size: int) -> bytes:
-        """Receive raw binary file data."""
         sock = self._require_connection()
         return sock.recv(size)
 
@@ -184,7 +165,6 @@ class FileTransferClient:
     # ------------------------------------------------------------
 
     def upload(self, local_path: str, remote_path: Optional[str] = None) -> None:
-        """Upload a local file to the server."""
         path = Path(local_path)
 
         if not path.is_file():
@@ -208,8 +188,9 @@ class FileTransferClient:
 
         if response.get("status") == "EXISTS":
             answer = input(
-                f"'{remote}' already exists on the server. Overwrite? [y/N]: "
+                f"'{remote}' already exists on the server. Overwrite? [Yes/No]: "
             ).strip().lower()
+            start = time.perf_counter()
 
             if answer not in ("y", "yes"):
                 self._send_json({"command": "CANCELED"})
@@ -235,7 +216,7 @@ class FileTransferClient:
                 self._send_data(chunk)
                 sent += len(chunk)
 
-                self._print_progress("Uploading", sent, file_size)
+                self._print_progress("Progress", sent, file_size)
 
 
         result = self._recv_json()
@@ -245,18 +226,11 @@ class FileTransferClient:
             raise RuntimeError(result.get("message", "Upload failed."))
 
         rate = self._rate_mb_s(sent, elapsed)
-        print(f"\nUpload complete: {sent / (1024 * 1024):.2f} MB")
+        print(f"\nSize: {sent/(1024*1024):.2f} MB")
         print(f"Time: {elapsed:.3f}s | Rate: {rate:.2f} MB/s")
+        print("[OK] Upload Completed.")
 
     def download(self, remote_path: str, local_path: Optional[str] = None) -> None:
-        """
-        Download a file from the server.
-
-        If a partial file named '<local>.part' exists, the client requests
-        a resume from its current size. The server must support:
-            {"command":"download","path":...,"offset":...}
-        and continue from that byte offset.
-        """
         destination = Path(local_path or Path(remote_path).name)
         partial = Path(str(destination) + ".part")
 
@@ -286,33 +260,6 @@ class FileTransferClient:
         sha256_expected = response.get("sha256")
         chunk_size = response.get("chunk_size")
 
-        # If the server rejects the requested resume offset, restart safely.
-        if offset != existing_size:
-            print(
-                f"Server requested offset {offset}; local partial file is "
-                f"{existing_size} bytes."
-            )
-            partial.unlink(missing_ok=True)
-            existing_size = 0
-
-            self._send_json(
-                {
-                    "command": "DOWNLOAD",
-                    "path": remote_path,
-                    "offset": 0,
-                }
-            )
-            response = self._recv_json()
-
-            if response.get("status") != "READY":
-                raise RuntimeError(
-                    response.get("message", "Download restart was rejected.")
-                )
-
-            total_size = int(response.get("size", total_size))
-            offset = int(response.get("offset", 0))
-            sha256_expected = response.get("sha256")
-
         mode = "ab" if offset > 0 else "wb"
         received = offset
 
@@ -327,15 +274,7 @@ class FileTransferClient:
                 file.write(data)
                 received += len(data)
 
-                self._print_progress("Downloading", received, total_size)
-
-        self._send_json(
-            {
-                "command": "download_complete",
-                "path": remote_path,
-                "size": received,
-            }
-        )
+                self._print_progress("Progress", received, total_size)
 
         result = self._recv_json()
 
@@ -344,7 +283,6 @@ class FileTransferClient:
                 result.get("message", "Server rejected download completion.")
             )
 
-        # Verify SHA-256 if the server supplied one.
         if sha256_expected:
             actual_hash = self._sha256_file(partial)
 
@@ -352,8 +290,6 @@ class FileTransferClient:
                 raise RuntimeError(
                     "SHA-256 verification failed. The downloaded file is corrupted."
                 )
-
-            print("\nSHA-256 verified.")
 
         partial.replace(destination)
 
@@ -364,9 +300,9 @@ class FileTransferClient:
         print(f"\nDownload complete: {destination}")
         print(f"Size: {total_size / (1024 * 1024):.2f} MB")
         print(f"Time: {elapsed:.3f}s | Rate: {rate:.2f} MB/s")
+        print("[OK] Download Completed.")
 
     def delete(self, remote_path: str) -> None:
-        """Delete a file on the server."""
         self._send_json({"command": "DELETE", "filename": remote_path})
 
         response = self._recv_json()
@@ -377,7 +313,6 @@ class FileTransferClient:
         print(response.get("message", f"Deleted: {remote_path}"))
 
     def directory(self, remote_path: str = ".") -> None:
-        """List files and subdirectories in a server directory."""
         self._send_json({"command": "DIR", "path": remote_path})
 
         response = self._recv_json()
@@ -391,7 +326,8 @@ class FileTransferClient:
             print("(directory is empty)")
             return
 
-        print(f"\nDirectory: {remote_path}")
+        print(f"\nDirectory: {remote_path}\n")
+        print(f"{'Filename':<20}{'Size':<20}{'Type':<20}")
         print("-" * 60)
 
         for entry in entries:
@@ -399,19 +335,26 @@ class FileTransferClient:
                 name = entry.get("name", "")
                 kind = entry.get("type", "file")
                 size = entry.get("size", "")
+                extension = Path(name).suffix
+
+                if extension == ".txt":
+                    kind = "Text"
+                elif extension == ".wav":
+                    kind = "Audio"
+                elif extension == ".mp4":
+                    kind = "Video"
 
                 if kind == "directory":
-                    print(f"[DIR]  {name}")
+                    print(f"{name:<20}{'N/A':<20}{'[DIR]':<20}")
                 else:
                     if size != "":
-                        print(f"[FILE] {name} ({size} bytes)")
+                        print(f"{name:<20}{f'{size/(1024*1024):.2f} MB':<20}{kind:<20}")
                     else:
                         print(f"[FILE] {name}")
             else:
                 print(entry)
 
     def subfolder(self, action: str, remote_path: str) -> None:
-        """Create or delete a server-side subfolder."""
         if action not in ("create", "delete"):
             raise ValueError("Subfolder action must be 'create' or 'delete'.")
 
@@ -430,11 +373,12 @@ class FileTransferClient:
                 response.get("message", f"Subfolder {action} failed.")
             )
 
-        print(response.get("message", f"Subfolder {action}: {remote_path}"))
+        print(f"[OK] Folder \'{remote_path}\' {action}d.")
 
-    # ------------------------------------------------------------
+
+
+
     # Helpers
-    # ------------------------------------------------------------
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
@@ -474,71 +418,51 @@ class FileTransferClient:
 
 
 def interactive_mode(client: FileTransferClient) -> None:
-    """
-    Run the client UI in the format demonstrated in the project help file.
 
-    Required menu:
-        1. Upload
-        2. Download
-        3. Delete
-        4. Subfolder Create
-        5. Subfolder Delete
-        6. Dir
-        7. Disconnect
-
-    The project reference expects progress, transfer time, speed, and clear
-    success/error feedback. The actual transfer methods above already collect
-    those metrics.
-    """
-
-    print("\n" + "=" * 56)
-    print("              FILE SHARING CLIENT v1.0")
-    print("=" * 56)
-
+    print("\n----------- COMMAND MENU -----------")
+    print("1. Upload")
+    print("2. Download")
+    print("3. Delete")
+    print("4. Dir")
+    print("5. Subfolder Create")
+    print("6. Subfolder Delete")
+    print("7. Disconnect")
+    print("------------------------------------")
     while True:
-        print("\n----------- COMMAND MENU -----------")
-        print("1. Upload")
-        print("2. Download")
-        print("3. Delete")
-        print("4. Subfolder Create")
-        print("5. Subfolder Delete")
-        print("6. Dir")
-        print("7. Disconnect")
-        print("------------------------------------")
 
         try:
-            choice = input("> ").strip()
-
+            choice = input("\n> ").strip()
+            client._require_connection()
             if choice == "1":
-                local = input("Enter local filename/path: ").strip()
+                local = input("> Enter local filename/path: ").strip()
 
                 if not local:
                     print("[ERROR] A local filename is required.")
                     continue
 
                 remote = input(
-                    "Enter server filename/path "
+                    "> Enter server filename/path: "
                     f"(press Enter to use '{Path(local).name}'): "
                 ).strip()
 
                 client.upload(local, remote or None)
 
             elif choice == "2":
-                remote = input("Enter server filename/path: ").strip()
+                remote = input("> Enter server filename/path: ").strip()
 
                 if not remote:
                     print("[ERROR] A server filename is required.")
                     continue
 
                 local = input(
-                    "Enter local filename/path "
+                    "> Enter local filename/path "
                     f"(press Enter to use '{Path(remote).name}'): "
                 ).strip()
 
                 client.download(remote, local or None)
 
             elif choice == "3":
-                remote = input("Enter server filename/path to delete: ").strip()
+                remote = input("> Enter server filename/path to delete: ").strip()
 
                 if not remote:
                     print("[ERROR] A server filename is required.")
@@ -547,7 +471,15 @@ def interactive_mode(client: FileTransferClient) -> None:
                 client.delete(remote)
 
             elif choice == "4":
-                remote = input("Enter subfolder path to create: ").strip()
+                remote = input(
+                    "> Enter server directory path "
+                    "(press Enter for root): "
+                ).strip()
+
+                client.directory(remote or ".")
+
+            elif choice == "5":
+                remote = input("> Enter subfolder path to create: ").strip()
 
                 if not remote:
                     print("[ERROR] A folder path is required.")
@@ -555,22 +487,14 @@ def interactive_mode(client: FileTransferClient) -> None:
 
                 client.subfolder("create", remote)
 
-            elif choice == "5":
-                remote = input("Enter subfolder path to delete: ").strip()
+            elif choice == "6":
+                remote = input("> Enter subfolder path to delete: ").strip()
 
                 if not remote:
                     print("[ERROR] A folder path is required.")
                     continue
 
                 client.subfolder("delete", remote)
-
-            elif choice == "6":
-                remote = input(
-                    "Enter server directory path "
-                    "(press Enter for root): "
-                ).strip()
-
-                client.directory(remote or ".")
 
             elif choice == "7":
                 print("[OK] Disconnected from server.")
@@ -587,39 +511,10 @@ def interactive_mode(client: FileTransferClient) -> None:
 
 
 def main() -> None:
-    #parser = argparse.ArgumentParser(
-        #description="CNT3004 networked file-sharing client"
-    #)
-    #parser.add_argument("--server", required=True, help="Server IP address")
-    #parser.add_argument("--port", type=int, required=True, help="Server TCP port")
-    #parser.add_argument("--username", required=True, help="Username")
-    #parser.add_argument(
-        #"--password",
-        #help="Password. If omitted, it will be entered without echo.",
-    #)
-    #parser.add_argument(
-        #"--chunk-size",
-        #type=int,
-        #default=DEFAULT_CHUNK_SIZE,
-        #help="Transfer chunk size in bytes (default: 1048576)",
-    #)
-#
-    #args = parser.parse_args()
-#
-    #if args.chunk_size <= 0:
-        #parser.error("--chunk-size must be greater than zero.")
-#
-    #password = args.password
-#
-    #if password is None:
-        #import getpass
-        #password = getpass.getpass("Password: ")
 
     client = FileTransferClient(
         server_ip= '172.20.5.200',
         port= 5000,
-        username= 'fern',
-        password= 'hello123'
     )
 
     try:
