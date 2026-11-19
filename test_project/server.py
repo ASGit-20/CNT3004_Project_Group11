@@ -33,7 +33,7 @@ from network_stats import NetworkStats
 # Configuration
 # ---------------------------------------------------------------------------
 
-HOST = "172.20.5.200"
+HOST = "172.20.10.2"
 PORT = 5000
 
 STORAGE_DIR = Path("server_storage")
@@ -256,6 +256,7 @@ def safe_original_filename(filename):
     return filename
 
 
+
 def choose_server_filename(original_filename):
     """Generate a unique logical server file name, such as TS001.txt."""
     extension = Path(original_filename).suffix.lower()
@@ -263,14 +264,32 @@ def choose_server_filename(original_filename):
 
     existing_numbers = []
 
-    for path in STORAGE_DIR.iterdir():
-        if path.is_file() and path.name.startswith(prefix):
+    # Check files in the main directory and all subfolders.
+    for path in STORAGE_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+
+        if path.name.startswith(prefix):
             stem = path.stem
             number_text = stem[len(prefix):]
+
             if number_text.isdigit():
                 existing_numbers.append(int(number_text))
 
+    # Check filenames currently reserved by active uploads.
+    with active_transfers_lock:
+        for filename in active_transfers:
+            active_name = Path(filename).name
+
+            if active_name.startswith(prefix):
+                stem = Path(active_name).stem
+                number_text = stem[len(prefix):]
+
+                if number_text.isdigit():
+                    existing_numbers.append(int(number_text))
+
     next_number = max(existing_numbers, default=0) + 1
+
     return f"{prefix}{next_number:03d}{extension}"
 
 
@@ -524,61 +543,143 @@ def handle_upload(sock, request, username):
             "message": str(error)
         })
 
-    except OSError:
+
+    except OSError as error:
+
+        print(f"Upload file error: {type(error).__name__}: {error}")
+
         send_message(sock, {
+
             "status": "ERROR",
+
             "message": "The server could not save the uploaded file."
+
         })
 
 
+
+
 def handle_download(sock, request, username):
-    server_filename = request.get("filename")
+    original_name = request.get("filename")
 
-    try:
-        path = get_storage_path(server_filename)
-    except ValueError as error:
-        send_message(sock, {"status": "ERROR", "message": str(error)})
+    if not isinstance(original_name, str) or not original_name:
+        send_message(sock, {
+            "status": "ERROR",
+            "message": "Invalid filename."
+        })
         return
 
-    if not path.is_file():
-        send_message(sock, {"status": "ERROR", "message": "File does not exist."})
-        return
-
-    file_size = path.stat().st_size
-    file_hash = hashlib.sha256()
-
-    # Calculate SHA-256 before sending, so the client can verify the result.
-    with path.open("rb") as file:
-        while True:
-            chunk = file.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            file_hash.update(chunk)
-
-    with active_transfers_lock:
-        active_transfers.add(server_filename)
-
-    send_message(sock, {
-        "status": "READY",
-        #"filename": server_filename,
-        "size": file_size,
-        "sha256": file_hash.hexdigest(),
-        f"chunk_size": CHUNK_SIZE
-    })
-
-    start_time = time.perf_counter()
-    bytes_sent = 0
+    server_filename = None
 
     try:
+        # Validate the original filename.
+        original_name = safe_original_filename(original_name)
+
+        # Find the metadata associated with the original filename.
+        matching_metadata = None
+        matching_metadata_path = None
+
+        for metadata_path in STORAGE_DIR.rglob("*.meta"):
+            try:
+                metadata = json.loads(
+                    metadata_path.read_text(encoding="utf-8")
+                )
+
+                if metadata.get("original_name") == original_name:
+                    matching_metadata = metadata
+                    matching_metadata_path = metadata_path
+                    break
+
+            except (OSError, json.JSONDecodeError):
+                continue
+
+        if matching_metadata is None:
+            send_message(sock, {
+                "status": "ERROR",
+                "message": "File metadata does not exist."
+            })
+            return
+
+        # Retrieve the server-assigned filename from metadata.
+        server_filename = matching_metadata.get("server_filename")
+
+        if not isinstance(server_filename, str) or not server_filename:
+            raise ValueError("File metadata is invalid.")
+
+        # Resolve the file path, including any subfolder.
+        path = get_server_storage_path(server_filename)
+
+        # Verify that the metadata file is located beside the requested file.
+        expected_metadata_path = path.with_name(path.name + ".meta")
+
+        if matching_metadata_path.resolve() != expected_metadata_path.resolve():
+            raise ValueError("File metadata does not match the requested file.")
+
+        if not path.is_file():
+            send_message(sock, {
+                "status": "ERROR",
+                "message": "File does not exist."
+            })
+            return
+
+        # Verify that the file size matches its metadata.
+        file_size = path.stat().st_size
+
+        if matching_metadata.get("size") != file_size:
+            send_message(sock, {
+                "status": "ERROR",
+                "message": "File size does not match its metadata."
+            })
+            return
+
+        # Reserve the file while it is being downloaded.
+        with active_transfers_lock:
+            if server_filename in active_transfers:
+                send_message(sock, {
+                    "status": "ERROR",
+                    "message": "File is currently being transferred."
+                })
+                return
+
+            active_transfers.add(server_filename)
+
+        # Calculate SHA-256 before sending the file.
+        file_hash = hashlib.sha256()
+
         with path.open("rb") as file:
             while True:
                 chunk = file.read(CHUNK_SIZE)
+
                 if not chunk:
                     break
+
+                file_hash.update(chunk)
+
+        # Tell the client that the file is ready.
+        send_message(sock, {
+            "status": "READY",
+            "size": file_size,
+            "sha256": file_hash.hexdigest(),
+            "chunk_size": CHUNK_SIZE
+        })
+
+        start_time = time.perf_counter()
+        bytes_sent = 0
+
+        # Send the raw file data.
+        with path.open("rb") as file:
+            while True:
+                chunk = file.read(CHUNK_SIZE)
+
+                if not chunk:
+                    break
+
                 sock.sendall(chunk)
                 bytes_sent += len(chunk)
 
         elapsed = time.perf_counter() - start_time
+
+        # Record download statistics.
         stats.record_transfer(
             direction="download",
             username=username,
@@ -592,9 +693,30 @@ def handle_download(sock, request, username):
             "bytes_sent": bytes_sent
         })
 
+    except ValueError as error:
+        send_message(sock, {
+            "status": "ERROR",
+            "message": str(error)
+        })
+
+    except OSError as error:
+        print(f"Download file error: {type(error).__name__}: {error}")
+
+        try:
+            send_message(sock, {
+                "status": "ERROR",
+                "message": "The server could not read the requested file."
+            })
+        except OSError:
+            pass
+
     finally:
-        with active_transfers_lock:
-            active_transfers.discard(server_filename)
+        # Release the file reservation.
+        if server_filename is not None:
+            with active_transfers_lock:
+                active_transfers.discard(server_filename)
+
+
 
 
 
@@ -703,8 +825,6 @@ def handle_delete(sock, request):
 
 def handle_directory(sock, request):
     requested_path = request.get("path", "")
-    print("Directory request:", repr(request))
-    print("Requested path:", repr(requested_path))
 
     try:
         # Root directory if no path was provided.
