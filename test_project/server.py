@@ -1,16 +1,16 @@
 """
-CNT3004 - Socket-Based Networked File Sharing Cloud
-Server application.
+CNT3004 - Socket-Based Networked File Sharing Cloud Server
 
-Protocol overview:
-- TCP connection protected by TLS.
-- Control messages are JSON with a 4-byte length prefix (network byte order).
-- File contents are sent as raw bytes in chunks after the server replies READY.
-- Each client connection is handled by its own thread.
+Overview:
+- TCP connection protected by TLS
+- Control messages are JSON with a 4-byte length prefix
+- File contents are sent as raw bytes in chunks after the server replies READY
+- Each client connection is handled by its own thread
 
 This file is designed to work with a client that follows the protocol described
 in the project documentation/comments below.
 """
+
 
 import argparse
 import hashlib
@@ -29,15 +29,15 @@ from pathlib import PurePosixPath
 from network_stats import NetworkStats
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
-HOST = "172.20.10.2"
+#  Configuration  ===========================================
+
+
+IP = "172.20.5.200"
 PORT = 5000
 
 STORAGE_DIR = Path("server_storage")
-USERS_FILE = Path("users.json")
+USER_LOGIN_FILE = Path("users.json")
 CERT_FILE = Path("server.crt")
 KEY_FILE = Path("server.key")
 
@@ -56,19 +56,47 @@ FILE_PREFIXES = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Shared server data
-# ---------------------------------------------------------------------------
+
+#  Shared Server Data  ===========================================
+
 
 stats = NetworkStats()
 storage_lock = threading.Lock()
 active_transfers = set()
 active_transfers_lock = threading.Lock()
 
+# Connection logging state.
+client_counter = 0
+active_clients = 0
+client_counter_lock = threading.Lock()
+active_clients_lock = threading.Lock()
+client_log_context = threading.local()
 
-# ---------------------------------------------------------------------------
-# Message framing
-# ---------------------------------------------------------------------------
+
+def log_thread(message, blank_line=False):
+    """Print a message with the current client's thread label.
+
+    Set blank_line=True to separate this message from the previous log group
+    with exactly one empty line.
+    """
+    if blank_line:
+        print()
+
+    thread_id = getattr(client_log_context, "thread_id", None)
+    if thread_id is None:
+        print(message)
+    else:
+        print(f"[THREAD-{thread_id}] {message}")
+
+
+def format_megabytes(byte_count):
+    """Format a byte count as MB for transfer log messages."""
+    return byte_count / (1024 * 1024)
+
+
+
+#  Message Framing  ===========================================
+
 
 def send_message(sock, message):
     """Send one JSON message preceded by its 4-byte length."""
@@ -113,9 +141,9 @@ def receive_message(sock):
     return message
 
 
-# ---------------------------------------------------------------------------
-# User authentication
-# ---------------------------------------------------------------------------
+
+#  User Authentication  ===========================================
+
 
 def hash_password(password, salt=None):
     """Create a salted PBKDF2 password hash."""
@@ -148,13 +176,13 @@ def verify_password(password, stored_salt, stored_hash):
 
 
 def load_users():
-    if not USERS_FILE.exists():
+    if not USER_LOGIN_FILE.exists():
         raise FileNotFoundError(
             "users.json was not found. Create an account with "
             "'python server.py --create-user USERNAME'."
         )
 
-    with USERS_FILE.open("r", encoding="utf-8") as file:
+    with USER_LOGIN_FILE.open("r", encoding="utf-8") as file:
         users = json.load(file)
 
     if not isinstance(users, dict):
@@ -173,8 +201,8 @@ def create_user(username):
         raise ValueError("Username must contain 1 to 64 characters.")
 
     users = {}
-    if USERS_FILE.exists():
-        with USERS_FILE.open("r", encoding="utf-8") as file:
+    if USER_LOGIN_FILE.exists():
+        with USER_LOGIN_FILE.open("r", encoding="utf-8") as file:
             users = json.load(file)
 
     if username in users:
@@ -196,15 +224,15 @@ def create_user(username):
         "iterations": PBKDF2_ITERATIONS
     }
 
-    with USERS_FILE.open("w", encoding="utf-8") as file:
+    with USER_LOGIN_FILE.open("w", encoding="utf-8") as file:
         json.dump(users, file, indent=4)
 
     try:
-        os.chmod(USERS_FILE, 0o600)
+        os.chmod(USER_LOGIN_FILE, 0o600)
     except OSError:
         pass
 
-    print(f"Created account for '{username}'.")
+    print(f"[SERVER] Created account for '{username}'.")
 
 
 def authenticate(message, users):
@@ -229,9 +257,9 @@ def authenticate(message, users):
         return False
 
 
-# ---------------------------------------------------------------------------
-# File naming and safe path handling
-# ---------------------------------------------------------------------------
+
+#  File Naming and Safe Path Handling  ===========================================
+
 
 def safe_original_filename(filename):
     """
@@ -334,9 +362,9 @@ def file_is_in_use(server_filename):
         return server_filename in active_transfers
 
 
-# ---------------------------------------------------------------------------
-# File operations
-# ---------------------------------------------------------------------------
+
+#  File Operations  ===========================================
+
 
 def handle_upload(sock, request, username):
     original_name = safe_original_filename(request.get("filename"))
@@ -469,6 +497,7 @@ def handle_upload(sock, request, username):
             "chunk_size": CHUNK_SIZE
         })
 
+        log_thread("Receiving file...")
         start_time = time.perf_counter()
         bytes_received = 0
         success = False
@@ -502,6 +531,13 @@ def handle_upload(sock, request, username):
             success = True
 
             elapsed = time.perf_counter() - start_time
+            log_thread("Upload completed.")
+            print(
+                f"[ANALYSIS] Upload: {format_megabytes(bytes_received):.0f} MB / "
+                f"{elapsed:.2f} s"
+            )
+            rate = format_megabytes(bytes_received) / elapsed if elapsed > 0 else 0
+            print(f"[ANALYSIS] Rate: {rate:.2f} MB/s")
 
             stats.record_transfer(
                 direction="upload",
@@ -546,7 +582,7 @@ def handle_upload(sock, request, username):
 
     except OSError as error:
 
-        print(f"Upload file error: {type(error).__name__}: {error}")
+        print(f"[ERROR] Upload failed: {error}")
 
         send_message(sock, {
 
@@ -555,7 +591,6 @@ def handle_upload(sock, request, username):
             "message": "The server could not save the uploaded file."
 
         })
-
 
 
 
@@ -643,6 +678,8 @@ def handle_download(sock, request, username):
 
             active_transfers.add(server_filename)
 
+        log_thread("Sending file...")
+
         # Calculate SHA-256 before sending the file.
         file_hash = hashlib.sha256()
 
@@ -678,6 +715,8 @@ def handle_download(sock, request, username):
                 bytes_sent += len(chunk)
 
         elapsed = time.perf_counter() - start_time
+        log_thread("Download completed.")
+        print(f"[ANALYSIS] Download: {format_megabytes(bytes_sent):.0f} MB")
 
         # Record download statistics.
         stats.record_transfer(
@@ -700,7 +739,7 @@ def handle_download(sock, request, username):
         })
 
     except OSError as error:
-        print(f"Download file error: {type(error).__name__}: {error}")
+        print(f"[ERROR] Download failed: {error}")
 
         try:
             send_message(sock, {
@@ -715,8 +754,6 @@ def handle_download(sock, request, username):
         if server_filename is not None:
             with active_transfers_lock:
                 active_transfers.discard(server_filename)
-
-
 
 
 
@@ -754,6 +791,7 @@ def handle_delete(sock, request):
                     continue
 
             if matching_metadata is None:
+                print("[ERROR] File does not exist.")
                 send_message(sock, {
                     "status": "ERROR",
                     "message": "File does not exist."
@@ -808,6 +846,7 @@ def handle_delete(sock, request):
             "status": "SUCCESS",
             "message": "File deleted."
         })
+        log_thread("File deleted.")
 
     except ValueError as error:
         send_message(sock, {
@@ -882,6 +921,7 @@ def handle_directory(sock, request):
             "path": requested_path,
             "entries": entries
         })
+        log_thread("Directory list sent.")
 
     except ValueError as error:
         send_message(sock, {
@@ -894,6 +934,7 @@ def handle_directory(sock, request):
             "status": "ERROR",
             "message": "Could not read directory."
         })
+
 
 
 def handle_subfolder(sock, request):
@@ -910,6 +951,7 @@ def handle_subfolder(sock, request):
         if action == "create":
             folder_path.mkdir(exist_ok=False)
             send_message(sock, {"status": "SUCCESS", "message": "Subfolder created."})
+            log_thread("Folder created.")
 
         elif action == "delete":
             folder_path.rmdir()  # Only succeeds if the folder is empty.
@@ -931,27 +973,29 @@ def handle_subfolder(sock, request):
         send_message(sock, {"status": "ERROR", "message": str(error)})
 
 
-# ---------------------------------------------------------------------------
-# One client connection
-# ---------------------------------------------------------------------------
+
+#  One Client Connection  ===========================================
+
 
 def handle_client(raw_client_socket, client_address, ssl_context, users):
     """Handle authentication and all requests from one connected client."""
+    global client_counter, active_clients
     client_socket = None
     username = None
+    counted_as_active = False
 
-    print(f"Connection from {client_address}")
+    with client_counter_lock:
+        client_counter += 1
+        thread_id = client_counter
+
+    client_log_context.thread_id = thread_id
+    print()
+    print(f"[CONNECT] {client_address[0]}:{client_address[1]}")
+    log_thread(f"Started for Client {thread_id}")
 
     try:
-        # TLS encrypts the connection. The client must also use TLS and
-        # verify/trust this server's certificate.
-        client_socket = ssl_context.wrap_socket(
-            raw_client_socket,
-            server_side=True
-        )
+        client_socket = ssl_context.wrap_socket(raw_client_socket, server_side=True)
         client_socket.settimeout(300)
-
-        # Require login before accepting file operations.
         login_request = receive_message(client_socket)
 
         if login_request.get("command") != "LOGIN" or not authenticate(login_request, users):
@@ -959,35 +1003,57 @@ def handle_client(raw_client_socket, client_address, ssl_context, users):
                 "status": "ERROR",
                 "message": "Invalid username or password."
             })
+            log_thread("[ERROR] Authentication failed.")
             return
 
         username = login_request.get("username")
         send_message(client_socket, {"status": "SUCCESS", "message": "Login successful."})
-        print(f"User '{username}' authenticated from {client_address}")
+        log_thread(f"[AUTH] {username} authenticated.", blank_line=True)
 
-        # Continue serving requests until the client disconnects.
+        with active_clients_lock:
+            active_clients += 1
+            counted_as_active = True
+            print(f"[SERVER] Active clients: {active_clients}")
+
         while True:
-            request_start = time.perf_counter()
             request = receive_message(client_socket)
+            request_start = time.perf_counter()
             command = request.get("command")
 
             if command == "UPLOAD":
+                log_thread(f"UPLOAD {request.get('filename', '')}", blank_line=True)
                 handle_upload(client_socket, request, username)
 
             elif command == "DOWNLOAD":
+                log_thread(f"DOWNLOAD {request.get('filename', '')}", blank_line=True)
                 handle_download(client_socket, request, username)
 
             elif command == "DELETE":
+                log_thread(f"DELETE {request.get('filename', '')}", blank_line=True)
                 handle_delete(client_socket, request)
 
             elif command == "DIR":
+                log_thread("DIR requested.", blank_line=True)
                 handle_directory(client_socket, request)
 
             elif command == "SUBFOLDER":
+                action = str(request.get("action", "")).upper()
+                folder = request.get("path", "")
+                log_thread(f"{action} {folder}", blank_line=True)
                 handle_subfolder(client_socket, request)
 
             elif command == "QUIT":
-                send_message(client_socket, {"status": "SUCCESS", "message": "Goodbye."})
+                send_message(client_socket, {
+                    "status": "SUCCESS",
+                    "message": "Goodbye."
+                })
+
+                response_time = time.perf_counter() - request_start
+                stats.record_response(
+                    username=username,
+                    command=str(command),
+                    response_time_seconds=response_time
+                )
                 break
 
             else:
@@ -995,8 +1061,10 @@ def handle_client(raw_client_socket, client_address, ssl_context, users):
                     "status": "ERROR",
                     "message": "Unknown command."
                 })
+                log_thread("[ERROR] Unknown command.")
 
             response_time = time.perf_counter() - request_start
+
             stats.record_response(
                 username=username,
                 command=str(command),
@@ -1004,20 +1072,20 @@ def handle_client(raw_client_socket, client_address, ssl_context, users):
             )
 
     except socket.timeout:
-        print(f"Client timed out: {client_address}")
+        pass
     except ConnectionError:
-        print(f"Client disconnected: {client_address}")
+        pass
     except ssl.SSLError as error:
-        print(f"TLS error with {client_address}: {error}")
+        log_thread(f"[ERROR] TLS error: {error}")
     except (ValueError, json.JSONDecodeError) as error:
-        print(f"Invalid request from {client_address}: {error}")
+        log_thread(f"[ERROR] Invalid request: {error}")
         if client_socket:
             try:
                 send_message(client_socket, {"status": "ERROR", "message": "Invalid request."})
             except OSError:
                 pass
     except OSError as error:
-        print(f"Network or file error for {client_address}: {error}")
+        log_thread(f"[ERROR] Network or file error: {error}")
     finally:
         if client_socket is not None:
             try:
@@ -1030,15 +1098,32 @@ def handle_client(raw_client_socket, client_address, ssl_context, users):
             except OSError:
                 pass
 
-        print(f"Connection closed: {client_address}")
+        log_thread("[DISCONNECT] Client disconnected.", blank_line=True)
+
+        if counted_as_active:
+            with active_clients_lock:
+                active_clients -= 1
+                print(f"[SERVER] Active clients: {active_clients}")
+                if active_clients == 0:
+                    print("[SERVER] Waiting for requests...")
+
+        try:
+            del client_log_context.thread_id
+        except AttributeError:
+            pass
 
 
-# ---------------------------------------------------------------------------
-# Server startup
-# ---------------------------------------------------------------------------
+
+#  Server Startup  ===========================================
+
 
 def start_server():
+    print("FILE SHARING SERVER v1.0\n")
+    print("[SERVER] Starting...")
+
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    print("[SERVER] Storage initialized.")
+
     users = load_users()
 
     if not CERT_FILE.is_file() or not KEY_FILE.is_file():
@@ -1048,23 +1133,26 @@ def start_server():
         )
 
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain(
-        certfile=str(CERT_FILE),
-        keyfile=str(KEY_FILE)
-    )
+    ssl_context.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen()
+    server_socket.bind((IP, PORT))
+    print(f"[SERVER] IP: {IP}")
+    print(f"[SERVER] Port: {PORT}")
+    # Network statistics are initialized through NetworkStats.
+    print("[ANALYSIS] Monitoring started.")
 
-    print(f"Server listening on {HOST}:{PORT}")
-    print(f"File storage directory: {STORAGE_DIR.resolve()}")
-    print("Press Ctrl+C to stop the server.")
+    server_socket.listen()
+    server_socket.settimeout(1.0)
+    print("[SERVER] Listening for connections...")
 
     try:
         while True:
-            raw_client_socket, client_address = server_socket.accept()
+            try:
+                raw_client_socket, client_address = server_socket.accept()
+            except socket.timeout:
+                continue
 
             client_thread = threading.Thread(
                 target=handle_client,
@@ -1074,12 +1162,12 @@ def start_server():
             client_thread.start()
 
     except KeyboardInterrupt:
-        print("\nServer shutting down...")
+        print("\n[SERVER] Shutting down...")
 
     finally:
         server_socket.close()
         stats.save()
-        print("Network statistics saved.")
+        print("[ANALYSIS] Statistics saved.")
 
 
 if __name__ == "__main__":

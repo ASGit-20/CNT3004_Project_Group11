@@ -1,14 +1,16 @@
 """
-Thread-safe network performance statistics for the CNT3004 server.
+CNT3004 - Network Performance Statistics
 
-Metrics are kept in memory while the server runs and saved to CSV files
-when the server shuts down.
+This file is designed to keep metrics in memory while the server runs
+and save them to CSV files when the server shuts down.
 """
+
 
 import csv
 import threading
 import time
 from pathlib import Path
+
 
 
 class NetworkStats:
@@ -31,10 +33,13 @@ class NetworkStats:
         duration_seconds
     ):
         """Record an upload or download and calculate its average data rate."""
+
         if duration_seconds > 0:
-            rate_mbps = (bytes_transferred / (1024 * 1024)) / duration_seconds
+            data_rate = (
+                bytes_transferred / (1024 * 1024)
+            ) / duration_seconds
         else:
-            rate_mbps = 0.0
+            data_rate = 0.0
 
         record = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -42,8 +47,8 @@ class NetworkStats:
             "username": username,
             "filename": filename,
             "bytes_transferred": bytes_transferred,
-            "duration_seconds": round(duration_seconds, 6),
-            "rate_MB_per_second": round(rate_mbps, 6)
+            "transfer_time_seconds": round(duration_seconds, 6),
+            "data_rate_MB_per_second": round(data_rate, 6)
         }
 
         with self.lock:
@@ -52,11 +57,12 @@ class NetworkStats:
         print(
             f"[STATS] {direction.upper()} {filename}: "
             f"{bytes_transferred} bytes in {duration_seconds:.3f}s "
-            f"({rate_mbps:.3f} MB/s)"
+            f"({data_rate:.3f} MB/s)"
         )
 
     def record_response(self, username, command, response_time_seconds):
-        """Record the time taken to handle one client command."""
+        """Record the time taken by the server to handle one client command."""
+
         record = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "username": username,
@@ -69,6 +75,7 @@ class NetworkStats:
 
     def save(self):
         """Write collected metrics to CSV files for offline analysis."""
+
         with self.lock:
             transfer_copy = list(self.transfer_records)
             response_copy = list(self.response_records)
@@ -76,17 +83,33 @@ class NetworkStats:
         transfer_file = self.output_directory / "transfer_stats.csv"
         response_file = self.output_directory / "response_stats.csv"
 
-        if transfer_copy:
-            with transfer_file.open("w", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=transfer_copy[0].keys())
-                writer.writeheader()
-                writer.writerows(transfer_copy)
+        # Always create both CSV files, even if they contain no records.
+        with transfer_file.open("w", newline="", encoding="utf-8") as file:
+            fieldnames = [
+                "timestamp",
+                "direction",
+                "username",
+                "filename",
+                "bytes_transferred",
+                "transfer_time_seconds",
+                "data_rate_MB_per_second"
+            ]
 
-        if response_copy:
-            with response_file.open("w", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=response_copy[0].keys())
-                writer.writeheader()
-                writer.writerows(response_copy)
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(transfer_copy)
 
-        print(f"Saved transfer statistics to: {transfer_file.resolve()}")
-        print(f"Saved response statistics to: {response_file.resolve()}")
+        with response_file.open("w", newline="", encoding="utf-8") as file:
+            fieldnames = [
+                "timestamp",
+                "username",
+                "command",
+                "response_time_seconds"
+            ]
+
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(response_copy)
+
+        print(f"[ANALYSIS] Transfer statistics saved: {transfer_file.resolve()}")
+        print(f"[ANALYSIS] Response statistics saved: {response_file.resolve()}")
